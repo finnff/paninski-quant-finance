@@ -384,8 +384,9 @@ def process_options_data(file_path):
         traceback.print_exc()
         return pd.DataFrame()  # Return empty DataFrame on error
 
-# Function to compare model prices with market prices
-def compare_option_prices(options_df, iv_model, entropy_series, hist_vol_series, risk_free_rate=RISK_FREE_RATE):
+# Updated compare_option_prices function with better error handling
+def compare_option_prices(options_df, iv_model, entropy_series, hist_vol_series, risk_free_rate=RISK_FREE_RATE,
+                          min_option_price=1.0, max_error_pct=500):
     """
     Compare model-derived option prices with market prices
     
@@ -395,6 +396,8 @@ def compare_option_prices(options_df, iv_model, entropy_series, hist_vol_series,
     - entropy_series: Series of entropy values
     - hist_vol_series: Series of historical volatility values
     - risk_free_rate: Risk-free interest rate
+    - min_option_price: Minimum option price to consider (filters out cheap options)
+    - max_error_pct: Maximum allowed percentage error (to filter outliers)
     
     Returns:
     - DataFrame with comparison results
@@ -408,6 +411,14 @@ def compare_option_prices(options_df, iv_model, entropy_series, hist_vol_series,
         
     dates = options_df['QUOTE_DATE'].unique()
     
+    # Initialize counters for filtering statistics
+    total_options = 0
+    filtered_by_dte = 0
+    filtered_by_price = 0
+    filtered_by_moneyness = 0
+    filtered_by_error = 0
+    retained_options = 0
+    
     for date in dates:
         date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
         
@@ -417,55 +428,132 @@ def compare_option_prices(options_df, iv_model, entropy_series, hist_vol_series,
         
         # Get options data for this date
         date_options = options_df[options_df['QUOTE_DATE'] == date]
+        total_options += len(date_options)
         
         # Get entropy and historical volatility for this date
         entropy = entropy_series.loc[date_str]
         hist_vol = hist_vol_series.loc[date_str]
         
+        # If entropy or hist_vol is a Series, get the scalar value
+        if isinstance(entropy, pd.Series):
+            entropy = entropy.iloc[0]
+        if isinstance(hist_vol, pd.Series):
+            hist_vol = hist_vol.iloc[0]
+        
         # Predict implied volatility
         implied_vol = predict_implied_volatility(iv_model, entropy, hist_vol)
         
         for _, option in date_options.iterrows():
-            # Basic filters
-            if option['DTE'] <= 0 or option['DTE'] > 180:  # Focus on options with reasonable DTEs
+            # Filter 1: Basic DTE filter - Focus on options with reasonable DTEs
+            if option['DTE'] <= 0 or option['DTE'] > 180:
+                filtered_by_dte += 1
                 continue
                 
             S = option['UNDERLYING_LAST']
             K = option['STRIKE']
             T = option['DTE'] / 365  # Convert DTE to years
             
-            # Calculate model prices using entropy-derived IV
-            model_call = black_scholes_call(S, K, T, risk_free_rate, implied_vol)
-            model_put = black_scholes_put(S, K, T, risk_free_rate, implied_vol)
+            # Filter 2: In-the-money filter
+            # For calls: Strike < Stock price (K < S)
+            # For puts: Strike > Stock price (K > S)
+            call_in_the_money = K < S
+            put_in_the_money = K > S
             
-            # Market prices and IVs
+            # Market prices
             market_call = option['C_MID']
             market_put = option['P_MID']
-            market_call_iv = option['C_IV']
-            market_put_iv = option['P_IV']
             
-            # Store results
-            results.append({
-                'date': date_str,
-                'strike': K,
-                'dte': option['DTE'],
-                'underlying': S,
-                'entropy': entropy,
-                'hist_vol': hist_vol,
-                'entropy_iv': implied_vol,
-                'market_call_iv': market_call_iv,
-                'market_put_iv': market_put_iv,
-                'model_call': model_call,
-                'market_call': market_call,
-                'call_error_pct': (model_call - market_call) / market_call * 100 if market_call > 0 else np.nan,
-                'model_put': model_put,
-                'market_put': market_put,
-                'put_error_pct': (model_put - market_put) / market_put * 100 if market_put > 0 else np.nan
-            })
+            # Filter 3: Price filter - Remove very cheap options
+            call_price_valid = market_call >= min_option_price if not pd.isna(market_call) else False
+            put_price_valid = market_put >= min_option_price if not pd.isna(market_put) else False
+            
+            # Apply filters
+            process_call = call_in_the_money and call_price_valid
+            process_put = put_in_the_money and put_price_valid
+            
+            if not (process_call or process_put):
+                if not (call_in_the_money or put_in_the_money):
+                    filtered_by_moneyness += 1
+                else:
+                    filtered_by_price += 1
+                continue
+            
+            # Check for extremely high implied volatility that could break Black-Scholes
+            if implied_vol > 2.0:  # Cap at 200% volatility
+                implied_vol = 2.0
+            
+            # Calculate model prices using entropy-derived IV
+            try:
+                model_call = black_scholes_call(S, K, T, risk_free_rate, implied_vol) if process_call else np.nan
+                model_put = black_scholes_put(S, K, T, risk_free_rate, implied_vol) if process_put else np.nan
+            except Exception as e:
+                # Skip options that cause calculation errors
+                print(f"Error calculating price for option {K}/{S} (DTE={option['DTE']}): {str(e)}")
+                continue
+            
+            # Market IVs
+            market_call_iv = option['C_IV'] if process_call else np.nan
+            market_put_iv = option['P_IV'] if process_put else np.nan
+            
+            # Calculate errors only for processed options
+            call_error_pct = np.nan
+            put_error_pct = np.nan
+            
+            if process_call and market_call > 0:
+                call_error_pct = (model_call - market_call) / market_call * 100
+                # Filter 4: Error magnitude filter
+                if abs(call_error_pct) > max_error_pct:
+                    filtered_by_error += 1
+                    process_call = False
+                    call_error_pct = np.nan
+            
+            if process_put and market_put > 0:
+                put_error_pct = (model_put - market_put) / market_put * 100
+                # Filter 4: Error magnitude filter
+                if abs(put_error_pct) > max_error_pct:
+                    filtered_by_error += 1
+                    process_put = False
+                    put_error_pct = np.nan
+            
+            # Only add options that passed all filters
+            if process_call or process_put:
+                # Store results
+                results.append({
+                    'date': date_str,
+                    'strike': K,
+                    'dte': option['DTE'],
+                    'underlying': S,
+                    'moneyness': K / S,
+                    'entropy': entropy,
+                    'hist_vol': hist_vol,
+                    'entropy_iv': implied_vol,
+                    'market_call_iv': market_call_iv,
+                    'market_put_iv': market_put_iv,
+                    'model_call': model_call if process_call else np.nan,
+                    'market_call': market_call if process_call else np.nan,
+                    'call_error_pct': call_error_pct,
+                    'model_put': model_put if process_put else np.nan,
+                    'market_put': market_put if process_put else np.nan,
+                    'put_error_pct': put_error_pct,
+                    'call_in_the_money': call_in_the_money,
+                    'put_in_the_money': put_in_the_money
+                })
+                
+                retained_options += 1
+    
+    # Print filtering statistics
+    print(f"\nOption Filtering Statistics:")
+    print(f"Total options considered: {total_options}")
+    print(f"Filtered by DTE (<=0 or >180 days): {filtered_by_dte} ({filtered_by_dte/total_options*100:.1f}%)")
+    print(f"Filtered by moneyness (out-of-the-money): {filtered_by_moneyness} ({filtered_by_moneyness/total_options*100:.1f}%)")
+    print(f"Filtered by price (<${min_option_price}): {filtered_by_price} ({filtered_by_price/total_options*100:.1f}%)")
+    print(f"Filtered by error magnitude (>{max_error_pct}%): {filtered_by_error}")
+    print(f"Options retained for analysis: {retained_options} ({retained_options/total_options*100:.1f}%)")
     
     return pd.DataFrame(results)
 
-# Function to visualize the comparison results
+
+# More robust visualization function that handles empty datasets
 def visualize_comparison(comparison_df):
     """
     Visualize the comparison between model and market prices
@@ -482,72 +570,118 @@ def visualize_comparison(comparison_df):
         return
     
     # Create figure with subplots
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    try:
+        plt.figure(figsize=(8, 6))  # Use smaller figure size to avoid memory issues
+        
+        # Prepare call and put data separately
+        call_data = comparison_df.dropna(subset=['call_error_pct'])
+        put_data = comparison_df.dropna(subset=['put_error_pct'])
+        
+        print(f"Visualizing {len(call_data)} call options and {len(put_data)} put options")
+        
+        # If we have too many points, sample them to avoid memory issues
+        max_points = 5000
+        if len(call_data) > max_points:
+            call_data = call_data.sample(max_points, random_state=42)
+            print(f"Sampling {max_points} call options for visualization")
+            
+        if len(put_data) > max_points:
+            put_data = put_data.sample(max_points, random_state=42)
+            print(f"Sampling {max_points} put options for visualization")
+        
+        # Plot histogram of call errors with reasonable bins
+        if not call_data.empty:
+            call_errors = call_data['call_error_pct']
+            call_errors_clipped = np.clip(call_errors, -100, 100)
+            plt.hist(call_errors_clipped, bins=30, alpha=0.5, label='Call Error %')
+            
+        # Plot histogram of put errors with reasonable bins
+        if not put_data.empty:
+            put_errors = put_data['put_error_pct']
+            put_errors_clipped = np.clip(put_errors, -100, 100)
+            plt.hist(put_errors_clipped, bins=30, alpha=0.5, label='Put Error %')
+        
+        plt.axvline(x=0, color='r', linestyle='--')
+        plt.title('Pricing Error Distribution (% Difference, Clipped to ±100%)')
+        plt.xlabel('Error Percentage')
+        plt.ylabel('Count')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('error_distribution.png')  # Save to file instead of displaying
+        print("Plot saved to error_distribution.png")
+        
+        # Calculate and print basic statistics
+        print("\nError Statistics (In-the-Money Options):")
+        
+        if not call_data.empty:
+            call_errors = call_data['call_error_pct']
+            print(f"Call Options:")
+            print(f"  Count: {len(call_errors)}")
+            print(f"  Mean Error: {call_errors.mean():.2f}%")
+            print(f"  Median Error: {call_errors.median():.2f}%")
+            print(f"  Mean Absolute Error: {call_errors.abs().mean():.2f}%")
+            print(f"  Standard Deviation: {call_errors.std():.2f}%")
+            print(f"  5th Percentile: {call_errors.quantile(0.05):.2f}%")
+            print(f"  95th Percentile: {call_errors.quantile(0.95):.2f}%")
+        
+        if not put_data.empty:
+            put_errors = put_data['put_error_pct']
+            print(f"\nPut Options:")
+            print(f"  Count: {len(put_errors)}")
+            print(f"  Mean Error: {put_errors.mean():.2f}%")
+            print(f"  Median Error: {put_errors.median():.2f}%")
+            print(f"  Mean Absolute Error: {put_errors.abs().mean():.2f}%")
+            print(f"  Standard Deviation: {put_errors.std():.2f}%")
+            print(f"  5th Percentile: {put_errors.quantile(0.05):.2f}%")
+            print(f"  95th Percentile: {put_errors.quantile(0.95):.2f}%")
+            
+    except Exception as e:
+        print(f"Error in visualization: {str(e)}")
+        import traceback
+        traceback.print_exc()   
+    # Calculate and print some basic statistics
+    print("\nError Statistics (In-the-Money Options):")
     
-    # Plot 1: Implied Volatility Comparison
-    ax1 = axes[0, 0]
-    ax1.scatter(comparison_df['market_call_iv'], comparison_df['entropy_iv'], alpha=0.5)
+    if not call_data.empty:
+        call_errors = call_data['call_error_pct'].dropna()
+        print(f"Call Options:")
+        print(f"  Count: {len(call_errors)}")
+        print(f"  Mean Error: {call_errors.mean():.2f}%")
+        print(f"  Median Error: {call_errors.median():.2f}%")
+        print(f"  Mean Absolute Error: {call_errors.abs().mean():.2f}%")
+        print(f"  Standard Deviation: {call_errors.std():.2f}%")
+        print(f"  5th Percentile: {call_errors.quantile(0.05):.2f}%")
+        print(f"  95th Percentile: {call_errors.quantile(0.95):.2f}%")
     
-    # Add perfect prediction line
-    min_val = min(comparison_df['market_call_iv'].min(), comparison_df['entropy_iv'].min())
-    max_val = max(comparison_df['market_call_iv'].max(), comparison_df['entropy_iv'].max())
-    ax1.plot([min_val, max_val], [min_val, max_val], 'r--')
+    if not put_data.empty:
+        put_errors = put_data['put_error_pct'].dropna()
+        print(f"\nPut Options:")
+        print(f"  Count: {len(put_errors)}")
+        print(f"  Mean Error: {put_errors.mean():.2f}%")
+        print(f"  Median Error: {put_errors.median():.2f}%")
+        print(f"  Mean Absolute Error: {put_errors.abs().mean():.2f}%")
+        print(f"  Standard Deviation: {put_errors.std():.2f}%")
+        print(f"  5th Percentile: {put_errors.quantile(0.05):.2f}%")
+        print(f"  95th Percentile: {put_errors.quantile(0.95):.2f}%")
     
-    ax1.set_title('Entropy-Derived IV vs Market Call IV')
-    ax1.set_xlabel('Market Call IV')
-    ax1.set_ylabel('Entropy-Derived IV')
-    ax1.grid(True)
+    # Additional visualizations with clipped error values
     
-    # Plot 2: Call Price Comparison
-    ax2 = axes[0, 1]
-    ax2.scatter(comparison_df['market_call'], comparison_df['model_call'], alpha=0.5)
-    
-    # Add perfect prediction line
-    min_val = min(comparison_df['market_call'].min(), comparison_df['model_call'].min())
-    max_val = max(comparison_df['market_call'].max(), comparison_df['model_call'].max())
-    ax2.plot([min_val, max_val], [min_val, max_val], 'r--')
-    
-    ax2.set_title('Model Call Price vs Market Call Price')
-    ax2.set_xlabel('Market Call Price')
-    ax2.set_ylabel('Model Call Price')
-    ax2.grid(True)
-    
-    # Plot 3: Put Price Comparison
-    ax3 = axes[1, 0]
-    ax3.scatter(comparison_df['market_put'], comparison_df['model_put'], alpha=0.5)
-    
-    # Add perfect prediction line
-    min_val = min(comparison_df['market_put'].min(), comparison_df['model_put'].min())
-    max_val = max(comparison_df['market_put'].max(), comparison_df['model_put'].max())
-    ax3.plot([min_val, max_val], [min_val, max_val], 'r--')
-    
-    ax3.set_title('Model Put Price vs Market Put Price')
-    ax3.set_xlabel('Market Put Price')
-    ax3.set_ylabel('Model Put Price')
-    ax3.grid(True)
-    
-    # Plot 4: Error Distribution
-    ax4 = axes[1, 1]
-    ax4.hist(comparison_df['call_error_pct'].dropna(), bins=50, alpha=0.5, label='Call Error %')
-    ax4.hist(comparison_df['put_error_pct'].dropna(), bins=50, alpha=0.5, label='Put Error %')
-    ax4.set_title('Pricing Error Distribution (% Difference)')
-    ax4.set_xlabel('Error Percentage')
-    ax4.set_ylabel('Count')
-    ax4.legend()
-    ax4.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Additional visualizations
-    # Pricing error by moneyness (Strike/Spot)
-    comparison_df['moneyness'] = comparison_df['strike'] / comparison_df['underlying']
-    
+    # Pricing error by moneyness
     plt.figure(figsize=(12, 6))
-    plt.scatter(comparison_df['moneyness'], comparison_df['call_error_pct'], alpha=0.5, label='Call Error %')
-    plt.scatter(comparison_df['moneyness'], comparison_df['put_error_pct'], alpha=0.5, label='Put Error %')
+    
+    if not call_data.empty:
+        call_errors_clipped = np.clip(call_data['call_error_pct'], -100, 100)
+        plt.scatter(call_data['moneyness'], call_errors_clipped, 
+                    alpha=0.5, color='blue', label='Call Error %')
+    
+    if not put_data.empty:
+        put_errors_clipped = np.clip(put_data['put_error_pct'], -100, 100)
+        plt.scatter(put_data['moneyness'], put_errors_clipped, 
+                    alpha=0.5, color='orange', label='Put Error %')
+    
     plt.axhline(y=0, color='r', linestyle='--')
-    plt.title('Pricing Error by Moneyness')
+    plt.title('Pricing Error by Moneyness (In-the-Money Options, Clipped to ±100%)')
     plt.xlabel('Moneyness (Strike/Spot)')
     plt.ylabel('Error Percentage')
     plt.legend()
@@ -556,17 +690,45 @@ def visualize_comparison(comparison_df):
     
     # Pricing error by DTE
     plt.figure(figsize=(12, 6))
-    plt.scatter(comparison_df['dte'], comparison_df['call_error_pct'], alpha=0.5, label='Call Error %')
-    plt.scatter(comparison_df['dte'], comparison_df['put_error_pct'], alpha=0.5, label='Put Error %')
+    
+    if not call_data.empty:
+        call_errors_clipped = np.clip(call_data['call_error_pct'], -100, 100)
+        plt.scatter(call_data['dte'], call_errors_clipped, 
+                    alpha=0.5, color='blue', label='Call Error %')
+    
+    if not put_data.empty:
+        put_errors_clipped = np.clip(put_data['put_error_pct'], -100, 100)
+        plt.scatter(put_data['dte'], put_errors_clipped, 
+                    alpha=0.5, color='orange', label='Put Error %')
+    
     plt.axhline(y=0, color='r', linestyle='--')
-    plt.title('Pricing Error by Days to Expiration')
+    plt.title('Pricing Error by Days to Expiration (In-the-Money Options, Clipped to ±100%)')
     plt.xlabel('Days to Expiration')
     plt.ylabel('Error Percentage')
     plt.legend()
     plt.grid(True)
     plt.show()
-
-
+    
+    # Error by implied volatility
+    plt.figure(figsize=(12, 6))
+    
+    if not call_data.empty:
+        call_errors_clipped = np.clip(call_data['call_error_pct'], -100, 100)
+        plt.scatter(call_data['market_call_iv'], call_errors_clipped, 
+                    alpha=0.5, color='blue', label='Call Error %')
+    
+    if not put_data.empty:
+        put_errors_clipped = np.clip(put_data['put_error_pct'], -100, 100)
+        plt.scatter(put_data['market_put_iv'], put_errors_clipped, 
+                    alpha=0.5, color='orange', label='Put Error %')
+    
+    plt.axhline(y=0, color='r', linestyle='--')
+    plt.title('Pricing Error by Market IV (In-the-Money Options, Clipped to ±100%)')
+    plt.xlabel('Market Implied Volatility')
+    plt.ylabel('Error Percentage')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 
 # Function to save comparison results to disk
@@ -674,14 +836,71 @@ def load_iv_model():
         print(f"Error loading cached IV model: {str(e)}")
         return None, None
 
-# Modified main function with caching
-def main(use_cache=True, save_results=True):
+
+# Updated example_option_pricing function to handle Series objects properly
+def example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model):
+    """
+    Price an example option using the entropy-derived volatility
+    
+    Parameters:
+    - spy: SPY price data
+    - spy_entropy: Entropy series for SPY
+    - spy_hist_vol: Historical volatility series for SPY
+    - iv_model: Calibrated IV model
+    """
+    try:
+        # Get the last date for which we have entropy
+        last_date = spy_entropy.index[-1]
+        
+        # Get scalar values, handling Series objects properly
+        entropy_value = float(spy_entropy.iloc[-1])
+        hist_vol_value = float(spy_hist_vol.loc[last_date].iloc[0] 
+                              if isinstance(spy_hist_vol.loc[last_date], pd.Series) 
+                              else spy_hist_vol.loc[last_date])
+        
+        # Get the stock price, ensuring it's a scalar
+        current_price = float(spy['Close'].iloc[-1])
+        
+        # Predict implied volatility
+        implied_vol = predict_implied_volatility(iv_model, entropy_value, hist_vol_value)
+        
+        # Set strike price as a percentage of current price
+        strike_price = round(current_price * 1.05, 2)  # 5% OTM
+        days_to_expiry = 30
+        
+        # Calculate option prices
+        call_price = black_scholes_call(
+            current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
+        )
+        put_price = black_scholes_put(
+            current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
+        )
+        
+        # Print results using scalar values
+        print(f"\nExample Option Pricing using Entropy-Derived Volatility:")
+        print(f"Date: {last_date}")
+        print(f"SPY Price: ${current_price:.2f}")
+        print(f"Strike Price: ${strike_price:.2f}")
+        print(f"Days to Expiry: {days_to_expiry}")
+        print(f"Entropy: {entropy_value:.4f}")
+        print(f"Historical Volatility: {hist_vol_value:.4f}")
+        print(f"Entropy-Derived Implied Volatility: {implied_vol:.4f}")
+        print(f"Call Option Price: ${call_price:.2f}")
+        print(f"Put Option Price: ${put_price:.2f}")
+    except Exception as e:
+        print(f"Error pricing example option: {str(e)}")
+        import traceback
+        traceback.print_exc()
+# Modified main function with maximum error percentage parameter
+def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=500):
     """
     Main function to run the entire analysis
     
     Parameters:
     - use_cache: Whether to use cached results if available
     - save_results: Whether to save results to disk
+    - min_option_price: Minimum option price to consider (filters out cheap options)
+    - max_error_pct: Maximum allowed percentage error (to filter outliers)
     """
     try:
         # If using cache, try to load comparison results first
@@ -691,9 +910,12 @@ def main(use_cache=True, save_results=True):
                 comparison_results = cache_data['comparison_results']
                 iv_metrics = cache_data['iv_metrics']
                 
-                # Calculate pricing error metrics
-                call_mae = np.abs(comparison_results['call_error_pct']).mean()
-                put_mae = np.abs(comparison_results['put_error_pct']).mean()
+                # Calculate pricing error metrics using finite values only
+                call_errors = comparison_results['call_error_pct'].dropna()
+                put_errors = comparison_results['put_error_pct'].dropna()
+                
+                call_mae = call_errors.abs().mean() if not call_errors.empty else np.nan
+                put_mae = put_errors.abs().mean() if not put_errors.empty else np.nan
                 
                 print(f"\nPricing Error Metrics:")
                 print(f"Call option MAE: {call_mae:.2f}%")
@@ -782,7 +1004,9 @@ def main(use_cache=True, save_results=True):
                 print("\nComparing entropy-based option prices with market prices...")
                 print("This may take a while for large datasets...")
                 comparison_results = compare_option_prices(
-                    spy_options, iv_model, spy_entropy, spy_hist_vol
+                    spy_options, iv_model, spy_entropy, spy_hist_vol,
+                    min_option_price=min_option_price,
+                    max_error_pct=max_error_pct
                 )
                 
                 # Save results if requested
@@ -790,11 +1014,14 @@ def main(use_cache=True, save_results=True):
                     save_comparison_results(comparison_results, iv_metrics, window_size)
                 
                 if not comparison_results.empty:
-                    # Calculate overall pricing error metrics
-                    call_mae = np.abs(comparison_results['call_error_pct']).mean()
-                    put_mae = np.abs(comparison_results['put_error_pct']).mean()
+                    # Calculate overall pricing error metrics using finite values only
+                    call_errors = comparison_results['call_error_pct'].dropna()
+                    put_errors = comparison_results['put_error_pct'].dropna()
                     
-                    print(f"\nPricing Error Metrics:")
+                    call_mae = call_errors.abs().mean() if not call_errors.empty else np.nan
+                    put_mae = put_errors.abs().mean() if not put_errors.empty else np.nan
+                    
+                    print(f"\nPricing Error Metrics (In-the-Money Options):")
                     print(f"Call option MAE: {call_mae:.2f}%")
                     print(f"Put option MAE: {put_mae:.2f}%")
                     
@@ -818,51 +1045,10 @@ def main(use_cache=True, save_results=True):
         print(f"Error during analysis: {str(e)}")
         import traceback
         traceback.print_exc()
-
-# Helper function for example option pricing
-def example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model):
-    """
-    Price an example option using the entropy-derived volatility
-    
-    Parameters:
-    - spy: SPY price data
-    - spy_entropy: Entropy series for SPY
-    - spy_hist_vol: Historical volatility series for SPY
-    - iv_model: Calibrated IV model
-    """
-    try:
-        last_date = spy_entropy.index[-1]
-        entropy_value = spy_entropy.iloc[-1]
-        hist_vol_value = spy_hist_vol.loc[last_date]
-        implied_vol = predict_implied_volatility(iv_model, entropy_value, hist_vol_value)
-        
-        current_price = spy['Close'].iloc[-1]
-        strike_price = round(current_price * 1.05, 2)  # 5% OTM
-        days_to_expiry = 30
-        
-        call_price = black_scholes_call(
-            current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
-        )
-        put_price = black_scholes_put(
-            current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
-        )
-        
-        print(f"\nExample Option Pricing using Entropy-Derived Volatility:")
-        print(f"Date: {last_date}")
-        print(f"SPY Price: ${current_price:.2f}")
-        print(f"Strike Price: ${strike_price:.2f}")
-        print(f"Days to Expiry: {days_to_expiry}")
-        print(f"Entropy: {entropy_value:.4f}")
-        print(f"Historical Volatility: {hist_vol_value:.4f}")
-        print(f"Entropy-Derived Implied Volatility: {implied_vol:.4f}")
-        print(f"Call Option Price: ${call_price:.2f}")
-        print(f"Put Option Price: ${put_price:.2f}")
-    except Exception as e:
-        print(f"Error pricing example option: {str(e)}")
-
-# Usage example
 if __name__ == "__main__":
     # You can control caching behavior here:
-    # - use_cache=True will use cached results if available
+    # - use_cache=False will force recalculation
     # - save_results=True will save new results to disk
-    main(use_cache=True, save_results=True)
+    # - min_option_price=1.0 will filter out options cheaper than $1.00
+    # - max_error_pct=500 will filter out options with errors greater than 500%
+    main(use_cache=False, save_results=True, min_option_price=1.0, max_error_pct=500)
