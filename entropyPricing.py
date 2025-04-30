@@ -3,10 +3,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yfinance as yf
-
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+import datetime
 
 # Data parameters
-DATA_START_DATE = '2014-01-01'  # Start date for data fetching
+DATA_START_DATE = '2020-01-01'  # Start date for data fetching
 DATA_END_DATE = '2024-12-31'    # End date for data fetching
 ENABLE_PLOT = True              # Set to True to enable visualization
 
@@ -16,35 +18,28 @@ ENTROPY_REGULARIZATION = None   # Regularization parameter (None for automatic c
 MIN_SAMPLES_FOR_CORRELATION = 3 # Minimum samples required for correlation calculation
 
 # Rolling window parameters
-ROLLING_WINDOW_SIZES = [5,10,20, 30, 60]  # Window sizes for rolling entropy calculation
+ROLLING_WINDOW_SIZES = [5, 10, 20, 30, 60]  # Window sizes for rolling entropy calculation
 DEFAULT_WINDOW_SIZE = 20         # Default window size for visualization
 
 # Lead-lag analysis parameters
 MAX_LAG_DAYS = 10               # Maximum days to test for lead-lag relationships
 LAG_STEP = 1                    # Step size between lag tests
 
-# Trading strategy parameters #TODO: wip
+# Trading strategy parameters
 ENTROPY_THRESHOLD = 0.7         # Threshold for trading signals (normalized entropy)
 
+# Risk-free rate (can be adjusted based on time period)
+RISK_FREE_RATE = 0.03
 
 def fetch_data(start=DATA_START_DATE, end=DATA_END_DATE):
     sp500 = yf.download("^GSPC", start=start, end=end)
     vix = yf.download("^VIX", start=start, end=end)
-    #converto to pd
+    spy = yf.download("SPY", start=start, end=end)
+    #convert to pd
     sp500 = pd.DataFrame(sp500)
     vix = pd.DataFrame(vix)
-    return sp500, vix
-
-#
-try:
-    sp500, vix = fetch_data()
-    #print head of the data + dimensions
-    print(f"SP500: {sp500.head()} \n {sp500.shape}") 
-    print(f"VIX: {vix.head()} \n {vix.shape}")
-except Exception as e:
-    print(f"Error fetching data: {e}")
-    exit(1)
-
+    spy = pd.DataFrame(spy)
+    return sp500, vix, spy
 
 # Define the Paninski entropy estimator class
 class PaninskiEntropyEstimator:
@@ -136,300 +131,542 @@ def normalize_series(series):
 
 # Calculate realized volatility
 def realized_volatility(returns, window=20):
+    """Calculate realized volatility (annualized)"""
     return returns.rolling(window).std() * np.sqrt(252)
 
-from sklearn.linear_model import LinearRegression
 
-def calibrate_entropy_to_volatility(entropy_series, vol_series):
-    common_idx = entropy_series.index.intersection(vol_series.index)
-    x = entropy_series.loc[common_idx].values.reshape(-1, 1)
-    y = vol_series.loc[common_idx].values
-    model = LinearRegression().fit(x, y)
-    return model
-
-# Calculate correlation between entropy and VIX
-def calculate_correlation(entropy_series, vix_series):
-    """Calculate correlation metrics between entropy and VIX"""
-    # Align dates first
-    common_dates = entropy_series.index.intersection(vix_series.index)
-    print(f"Common dates count: {len(common_dates)}")
-    aligned_entropy = entropy_series.loc[common_dates].values.reshape(-1)
-    aligned_vix = vix_series.loc[common_dates].values.reshape(-1)
-    print(f"Aligned entropy shape: {aligned_entropy.shape}")
-    print(f"Aligned vix shape: {aligned_vix.shape}")
+# Enhanced function to calibrate implied volatility using both entropy and historical volatility
+def calibrate_implied_volatility(entropy_series, hist_vol_series, vix_series):
+    """
+    Create a model that maps entropy and historical volatility to implied volatility (VIX)
     
-    try:
-        pearson_corr, pearson_p = stats.pearsonr(aligned_entropy, aligned_vix)
-        spearman_corr, spearman_p = stats.spearmanr(aligned_entropy, aligned_vix)
-    except ValueError:
-        # Handle case where inputs are constant or have other issues
-        pearson_corr = pearson_p = spearman_corr = spearman_p = np.nan
+    Parameters:
+    - entropy_series: Series of entropy values
+    - hist_vol_series: Series of historical volatility values
+    - vix_series: Series of VIX values (proxy for implied volatility)
     
-    return {
-        'pearson_corr': pearson_corr,
-        'pearson_p': pearson_p,
-        'spearman_corr': spearman_corr,
-        'spearman_p': spearman_p
+    Returns:
+    - Calibrated regression model and evaluation metrics
+    """
+    # Align all series
+    common_idx = entropy_series.index.intersection(
+        hist_vol_series.index.intersection(vix_series.index)
+    )
+    
+    if len(common_idx) < 10:
+        raise ValueError("Insufficient data for calibration (less than 10 common dates)")
+    
+    # Print debug info about our data shapes
+    print(f"Entropy series shape: {entropy_series.loc[common_idx].shape}")
+    print(f"Hist vol series shape: {hist_vol_series.loc[common_idx].shape}")
+    print(f"VIX series shape: {vix_series.loc[common_idx].shape}")
+    
+    # Make sure everything is 1D by forcing to numpy arrays and flattening
+    entropy_values = np.array(entropy_series.loc[common_idx]).flatten()
+    hist_vol_values = np.array(hist_vol_series.loc[common_idx]).flatten()
+    vix_values = np.array(vix_series.loc[common_idx]).flatten()
+    
+    # Prepare features (X) and target (y) with these flattened arrays
+    X = pd.DataFrame({
+        'entropy': entropy_values,
+        'hist_vol': hist_vol_values
+    })
+    y = vix_values
+    
+    # Print shapes after flattening
+    print(f"X shape after flattening: {X.shape}")
+    print(f"y shape after flattening: {y.shape}")
+    
+    # Create and fit the model
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    # Predict and evaluate
+    y_pred = model.predict(X)
+    
+    # Calculate evaluation metrics
+    metrics = {
+        'r2': r2_score(y, y_pred),
+        'mse': mean_squared_error(y, y_pred),
+        'rmse': np.sqrt(mean_squared_error(y, y_pred)),
+        'mae': mean_absolute_error(y, y_pred),
+        'coefficients': {
+            'intercept': model.intercept_,
+            'entropy': model.coef_[0],
+            'hist_vol': model.coef_[1]
+        }
     }
-
-
-# Analyze lead-lag relationship
-def analyze_lead_lag(entropy_series, vix_series, max_lag=10):
-    """Analyze lead-lag relationship between entropy and VIX"""
-    # Ensure both series are aligned on the same index
-    common_index = entropy_series.index.intersection(vix_series.index)
-    entropy_aligned = entropy_series.loc[common_index]
-    vix_aligned = vix_series.loc[common_index]
     
-    correlations = []
-    lags = range(-max_lag, max_lag + 1)
+    return model, metrics
+
+# Function to predict implied volatility using the calibrated model - FIXED VERSION
+def predict_implied_volatility(model, entropy, hist_vol):
+    """
+    Predict implied volatility using the calibrated model
     
-    for lag in lags:
-        if lag < 0:
-            # VIX leads entropy - shift VIX forward
-            shifted_vix = vix_aligned.copy()
-            shifted_entropy = entropy_aligned.shift(abs(lag))
-            # Drop NaNs from shifting and align data
-            valid_idx = shifted_entropy.dropna().index
-            aligned_vix = shifted_vix.loc[valid_idx].values.reshape(-1)
-            aligned_entropy = shifted_entropy.loc[valid_idx].values.reshape(-1)
-            if len(aligned_vix) > 1 and len(aligned_entropy) > 1:  # Need at least 2 points for correlation
-                corr = np.corrcoef(aligned_vix, aligned_entropy)[0, 1]
-            else:
-                corr = np.nan
-        elif lag > 0:
-            # Entropy leads VIX - shift entropy forward
-            shifted_entropy = entropy_aligned.copy()
-            shifted_vix = vix_aligned.shift(lag)
-            # Drop NaNs from shifting and align data
-            valid_idx = shifted_vix.dropna().index
-            aligned_vix = shifted_vix.loc[valid_idx].values.reshape(-1)
-            aligned_entropy = shifted_entropy.loc[valid_idx].values.reshape(-1)
-            if len(aligned_vix) > 1 and len(aligned_entropy) > 1:
-                corr = np.corrcoef(aligned_vix, aligned_entropy)[0, 1]
-            else:
-                corr = np.nan
-        else:
-            # No lag - ensure we're working with numpy arrays
-            aligned_vix = vix_aligned.values.reshape(-1)
-            aligned_entropy = entropy_aligned.values.reshape(-1)
-            if len(aligned_vix) > 1 and len(aligned_entropy) > 1:
-                corr = np.corrcoef(aligned_vix, aligned_entropy)[0, 1]
-            else:
-                corr = np.nan
+    Parameters:
+    - model: Calibrated regression model
+    - entropy: Entropy value or series
+    - hist_vol: Historical volatility value or series
+    
+    Returns:
+    - Predicted implied volatility value or series
+    """
+    if isinstance(entropy, pd.Series) and isinstance(hist_vol, pd.Series):
+        # Align dates
+        common_idx = entropy.index.intersection(hist_vol.index)
         
-        correlations.append(corr)
+        # Ensure we have flattened arrays
+        entropy_values = np.array(entropy.loc[common_idx]).flatten()
+        hist_vol_values = np.array(hist_vol.loc[common_idx]).flatten()
+        
+        # Use the same feature names as during training
+        X = pd.DataFrame({
+            'entropy': entropy_values,
+            'hist_vol': hist_vol_values
+        })
+        pred = model.predict(X)
+        return pd.Series(pred, index=common_idx)
+    else:
+        # Handle single value case - properly extract from Series if needed
+        if isinstance(entropy, pd.Series):
+            entropy_val = float(entropy.iloc[0])
+        else:
+            entropy_val = float(entropy)
+            
+        if isinstance(hist_vol, pd.Series):
+            hist_vol_val = float(hist_vol.iloc[0])
+        else:
+            hist_vol_val = float(hist_vol)
+        
+        # Use the same feature names as during training
+        X = pd.DataFrame({
+            'entropy': [entropy_val],
+            'hist_vol': [hist_vol_val]
+        })
+        return model.predict(X)[0]# Black-Scholes option pricing functions
+def black_scholes_call(S, K, T, r, sigma):
+    """
+    Calculate Black-Scholes price for a call option
     
-    return pd.Series(correlations, index=lags)
-
-#TODO: Implement a trading strategy based on entropy signals, 
-#currently only buys once then hodls, should be able to sell as well
-
-def backtest_strategy(sp500, entropy_series, threshold=ENTROPY_THRESHOLD):
-    # Get dates where entropy exceeds threshold (normalized)
-    norm_entropy = normalize_series(entropy_series)
+    Parameters:
+    - S: Current stock price
+    - K: Strike price
+    - T: Time to maturity (in years)
+    - r: Risk-free interest rate
+    - sigma: Volatility
     
-    # Create a trading signal series (1 = in market, 0 = out of market)
-    signal = pd.Series(0, index=sp500.index)
+    Returns:
+    - Call option price
+    """
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
     
-    # Set signals: 1 when entropy > threshold, 0 when entropy <= threshold
-    common_dates = signal.index.intersection(norm_entropy.index)
-    signal.loc[common_dates] = (norm_entropy.loc[common_dates] > threshold).astype(int)
-    
-    # Calculate strategy returns
-    sp500_returns = calculate_returns(sp500)
-    strategy_returns = sp500_returns * signal.shift(1).dropna()  # Apply signal with 1-day delay
-    
-    # Calculate metrics
-    cumulative_market = (1 + sp500_returns).cumprod() - 1
-    cumulative_strategy = (1 + strategy_returns).cumprod() - 1
-    
-    # Calculate Sharpe ratio (252 market days per year)
-    sharpe_market = np.sqrt(252) * sp500_returns.mean() / sp500_returns.std()
-    sharpe_strategy = np.sqrt(252) * strategy_returns.mean() / strategy_returns.std()
-    
-    return {
-        'market_returns': cumulative_market,
-        'strategy_returns': cumulative_strategy,
-        'sharpe_market': sharpe_market,
-        'sharpe_strategy': sharpe_strategy
-    }
-
-# Calculate the Black-Scholes price of a call option
-def black_scholes_price(spot, strike, time_to_expiry, rate, volatility):
-    d1 = (np.log(spot / strike) + (rate + 0.5 * volatility ** 2) * time_to_expiry) / (volatility * np.sqrt(time_to_expiry))
-    d2 = d1 - volatility * np.sqrt(time_to_expiry)
-    call_price = spot * stats.norm.cdf(d1) - strike * np.exp(-rate * time_to_expiry) * stats.norm.cdf(d2)
+    call_price = S * stats.norm.cdf(d1) - K * np.exp(-r * T) * stats.norm.cdf(d2)
     return call_price
 
-# Main benchmark function
-def benchmark_entropy_vs_vix(sp500, vix, window_sizes=[20, 40, 60]):
-    """Main benchmark function comparing Paninski entropy with VIX"""
-    results = {}
+def black_scholes_put(S, K, T, r, sigma):
+    """
+    Calculate Black-Scholes price for a put option
     
-    # Calculate returns
-    returns = calculate_returns(sp500)
+    Parameters:
+    - S: Current stock price
+    - K: Strike price
+    - T: Time to maturity (in years)
+    - r: Risk-free interest rate
+    - sigma: Volatility
     
-    # Process VIX data
-    vix_data = vix['Close']
+    Returns:
+    - Put option price
+    """
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
     
-    # Calculate entropy for different window sizes
-    for window in window_sizes:
-        print(f"\nCalculating entropy with window size {window}...")
-        print(f"Returns length: {len(returns)}")
-        entropy_series = calculate_rolling_entropy(returns, window_size=window)
-        
-        # Normalize both series
-        norm_entropy = normalize_series(entropy_series)
-        norm_vix = normalize_series(vix_data)
-        
-        # Calculate correlation
-        correlation = calculate_correlation(norm_entropy, norm_vix.loc[norm_entropy.index])
-        
-        try:
-            # Analyze lead-lag relationship
-            vix_to_compare = norm_vix.loc[norm_entropy.index]
-            if len(vix_to_compare) > 1:  # Need at least 2 points for correlation
-                lead_lag = analyze_lead_lag(norm_entropy, vix_to_compare)
-            else:
-                lead_lag = pd.Series([np.nan] * 21, index=range(-10, 11))
-        except Exception as e:
-            print(f"Error in lead-lag analysis: {e}")
-            lead_lag = pd.Series([np.nan] * 21, index=range(-10, 11))
-        
-        # Store results
-        results[window] = {
-            'entropy': entropy_series,
-            'normalized_entropy': norm_entropy,
-            'correlation': correlation,
-            'lead_lag': lead_lag
-        }
-    
-    return results
+    put_price = K * np.exp(-r * T) * stats.norm.cdf(-d2) - S * stats.norm.cdf(-d1)
+    return put_price
 
-# Visualization function
-def visualize_results(sp500, vix, results, window_size=20):
-    """Visualize benchmark results"""
+# Function to process SPY options data
+def process_options_data(file_path):
+    """
+    Process SPY options data from CSV file
+    
+    Parameters:
+    - file_path: Path to the CSV file containing options data
+    
+    Returns:
+    - Processed DataFrame with options data
+    """
+    try:
+        # First, read a few lines to examine the format
+        with open(file_path, 'r') as f:
+            sample = ''.join([f.readline() for _ in range(5)])
+        print(f"Sample of options file:\n{sample}")
+        
+        # Read CSV file with better error handling
+        options_df = pd.read_csv(file_path, sep=',', low_memory=False)
+        print(f"Original columns: {options_df.columns.tolist()}")
+        
+        # Handle brackets in column names
+        columns = {}
+        for col in options_df.columns:
+            # Remove brackets and trim
+            clean_col = col.replace('[', '').replace(']', '').strip()
+            columns[col] = clean_col
+        
+        # Rename columns
+        options_df = options_df.rename(columns=columns)
+        print(f"Cleaned columns: {options_df.columns.tolist()}")
+        
+        # Convert numeric columns to appropriate types
+        numeric_cols = [
+            'UNDERLYING_LAST', 'DTE', 'STRIKE', 
+            'C_DELTA', 'C_GAMMA', 'C_VEGA', 'C_THETA', 'C_RHO', 'C_IV', 
+            'C_VOLUME', 'C_LAST', 'C_BID', 'C_ASK',
+            'P_BID', 'P_ASK', 'P_LAST', 'P_DELTA', 'P_GAMMA', 'P_VEGA', 
+            'P_THETA', 'P_RHO', 'P_IV', 'P_VOLUME', 
+            'STRIKE_DISTANCE', 'STRIKE_DISTANCE_PCT'
+        ]
+        
+        for col in numeric_cols:
+            if col in options_df.columns:
+                # First, replace empty strings with NaN
+                options_df[col] = options_df[col].replace('', np.nan)
+                # Then convert to float, coercing errors to NaN
+                options_df[col] = pd.to_numeric(options_df[col], errors='coerce')
+        
+        # Convert date columns to datetime
+        options_df['QUOTE_DATE'] = pd.to_datetime(options_df['QUOTE_DATE'])
+        options_df['EXPIRE_DATE'] = pd.to_datetime(options_df['EXPIRE_DATE'])
+        
+        # Calculate mid prices from bid and ask
+        if 'C_BID' in options_df.columns and 'C_ASK' in options_df.columns:
+            options_df['C_MID'] = (options_df['C_BID'] + options_df['C_ASK']) / 2
+        
+        if 'P_BID' in options_df.columns and 'P_ASK' in options_df.columns:
+            options_df['P_MID'] = (options_df['P_BID'] + options_df['P_ASK']) / 2
+        
+        # Filter options with non-zero prices and reasonable IVs
+        filter_conditions = []
+        
+        if 'C_MID' in options_df.columns:
+            filter_conditions.append(options_df['C_MID'] > 0)
+        if 'P_MID' in options_df.columns:
+            filter_conditions.append(options_df['P_MID'] > 0)
+        if 'C_IV' in options_df.columns:
+            filter_conditions.append(options_df['C_IV'] > 0)
+            filter_conditions.append(options_df['C_IV'] < 2)
+        if 'P_IV' in options_df.columns:
+            filter_conditions.append(options_df['P_IV'] > 0)
+            filter_conditions.append(options_df['P_IV'] < 2)
+        
+        if filter_conditions:
+            # Use all conditions with AND logic
+            final_filter = filter_conditions[0]
+            for cond in filter_conditions[1:]:
+                final_filter = final_filter & cond
+                
+            options_df = options_df[final_filter]
+        
+        print(f"Processed {len(options_df)} option records")
+        return options_df
+        
+    except Exception as e:
+        print(f"Error processing options data: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()  # Return empty DataFrame on error
+
+# Function to compare model prices with market prices
+def compare_option_prices(options_df, iv_model, entropy_series, hist_vol_series, risk_free_rate=RISK_FREE_RATE):
+    """
+    Compare model-derived option prices with market prices
+    
+    Parameters:
+    - options_df: DataFrame containing SPY options data
+    - iv_model: Calibrated implied volatility model
+    - entropy_series: Series of entropy values
+    - hist_vol_series: Series of historical volatility values
+    - risk_free_rate: Risk-free interest rate
+    
+    Returns:
+    - DataFrame with comparison results
+    """
+    results = []
+    
+    # Get unique dates in options data - use the column name we know exists
+    if 'QUOTE_DATE' not in options_df.columns:
+        print(f"Column 'QUOTE_DATE' not found. Available columns: {options_df.columns.tolist()}")
+        return pd.DataFrame()
+        
+    dates = options_df['QUOTE_DATE'].unique()
+    
+    for date in dates:
+        date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+        
+        # Skip if we don't have entropy or hist_vol for this date
+        if date_str not in entropy_series.index or date_str not in hist_vol_series.index:
+            continue
+        
+        # Get options data for this date
+        date_options = options_df[options_df['QUOTE_DATE'] == date]
+        
+        # Get entropy and historical volatility for this date
+        entropy = entropy_series.loc[date_str]
+        hist_vol = hist_vol_series.loc[date_str]
+        
+        # Predict implied volatility
+        implied_vol = predict_implied_volatility(iv_model, entropy, hist_vol)
+        
+        for _, option in date_options.iterrows():
+            # Basic filters
+            if option['DTE'] <= 0 or option['DTE'] > 180:  # Focus on options with reasonable DTEs
+                continue
+                
+            S = option['UNDERLYING_LAST']
+            K = option['STRIKE']
+            T = option['DTE'] / 365  # Convert DTE to years
+            
+            # Calculate model prices using entropy-derived IV
+            model_call = black_scholes_call(S, K, T, risk_free_rate, implied_vol)
+            model_put = black_scholes_put(S, K, T, risk_free_rate, implied_vol)
+            
+            # Market prices and IVs
+            market_call = option['C_MID']
+            market_put = option['P_MID']
+            market_call_iv = option['C_IV']
+            market_put_iv = option['P_IV']
+            
+            # Store results
+            results.append({
+                'date': date_str,
+                'strike': K,
+                'dte': option['DTE'],
+                'underlying': S,
+                'entropy': entropy,
+                'hist_vol': hist_vol,
+                'entropy_iv': implied_vol,
+                'market_call_iv': market_call_iv,
+                'market_put_iv': market_put_iv,
+                'model_call': model_call,
+                'market_call': market_call,
+                'call_error_pct': (model_call - market_call) / market_call * 100 if market_call > 0 else np.nan,
+                'model_put': model_put,
+                'market_put': market_put,
+                'put_error_pct': (model_put - market_put) / market_put * 100 if market_put > 0 else np.nan
+            })
+    
+    return pd.DataFrame(results)
+
+# Function to visualize the comparison results
+def visualize_comparison(comparison_df):
+    """
+    Visualize the comparison between model and market prices
+    
+    Parameters:
+    - comparison_df: DataFrame with comparison results
+    """
     if not ENABLE_PLOT:
         print("Plotting disabled. Set ENABLE_PLOT to True to visualize results.")
         return
     
-    # Extract data for the specified window size
-    entropy_data = results[window_size]['normalized_entropy']
-    vix_data = normalize_series(vix['Close'])
-    correlation = results[window_size]['correlation']
-    lead_lag = results[window_size]['lead_lag']
+    if comparison_df.empty:
+        print("No comparison data available for visualization.")
+        return
     
-    # Create a figure with subplots
-    fig, axes = plt.subplots(3, 1, figsize=(12, 15), sharex=False)
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
-    # Plot 1: Entropy vs VIX
-    ax1 = axes[0]
-    ax1.plot(entropy_data.index, entropy_data, 'b-', label='Normalized Entropy')
-    ax1.plot(vix_data.index, vix_data, 'r-', label='Normalized VIX')
-    ax1.set_title(f'Entropy (window={window_size}) vs VIX')
-    ax1.set_ylabel('Normalized Value')
-    ax1.legend()
+    # Plot 1: Implied Volatility Comparison
+    ax1 = axes[0, 0]
+    ax1.scatter(comparison_df['market_call_iv'], comparison_df['entropy_iv'], alpha=0.5)
+    
+    # Add perfect prediction line
+    min_val = min(comparison_df['market_call_iv'].min(), comparison_df['entropy_iv'].min())
+    max_val = max(comparison_df['market_call_iv'].max(), comparison_df['entropy_iv'].max())
+    ax1.plot([min_val, max_val], [min_val, max_val], 'r--')
+    
+    ax1.set_title('Entropy-Derived IV vs Market Call IV')
+    ax1.set_xlabel('Market Call IV')
+    ax1.set_ylabel('Entropy-Derived IV')
     ax1.grid(True)
     
-    # Plot 2: S&P 500 with entropy overlay
-    ax2 = axes[1]
-    ax2.plot(sp500.index, sp500['Close'], 'g-', label='S&P 500')
-    ax2.set_ylabel('S&P 500', color='g')
-    ax2.tick_params(axis='y', labelcolor='g')
-    ax2.set_title('S&P 500 with Entropy Overlay')
+    # Plot 2: Call Price Comparison
+    ax2 = axes[0, 1]
+    ax2.scatter(comparison_df['market_call'], comparison_df['model_call'], alpha=0.5)
     
-    ax2_twin = ax2.twinx()
-    ax2_twin.plot(entropy_data.index, entropy_data, 'b-', label='Entropy')
-    ax2_twin.set_ylabel('Normalized Entropy', color='b')
-    ax2_twin.tick_params(axis='y', labelcolor='b')
+    # Add perfect prediction line
+    min_val = min(comparison_df['market_call'].min(), comparison_df['model_call'].min())
+    max_val = max(comparison_df['market_call'].max(), comparison_df['model_call'].max())
+    ax2.plot([min_val, max_val], [min_val, max_val], 'r--')
+    
+    ax2.set_title('Model Call Price vs Market Call Price')
+    ax2.set_xlabel('Market Call Price')
+    ax2.set_ylabel('Model Call Price')
     ax2.grid(True)
     
-    # Plot 3: Lead-Lag Analysis
-    ax3 = axes[2]
-    ax3.bar(lead_lag.index, lead_lag.values)
-    ax3.axhline(y=0, color='r', linestyle='-', alpha=0.3)
-    ax3.set_title('Lead-Lag Correlation Analysis')
-    ax3.set_xlabel('Lag (days)')
-    ax3.set_ylabel('Correlation')
+    # Plot 3: Put Price Comparison
+    ax3 = axes[1, 0]
+    ax3.scatter(comparison_df['market_put'], comparison_df['model_put'], alpha=0.5)
+    
+    # Add perfect prediction line
+    min_val = min(comparison_df['market_put'].min(), comparison_df['model_put'].min())
+    max_val = max(comparison_df['market_put'].max(), comparison_df['model_put'].max())
+    ax3.plot([min_val, max_val], [min_val, max_val], 'r--')
+    
+    ax3.set_title('Model Put Price vs Market Put Price')
+    ax3.set_xlabel('Market Put Price')
+    ax3.set_ylabel('Model Put Price')
     ax3.grid(True)
     
-    # Add correlation details as text
-    text = (f"Pearson Correlation: {correlation['pearson_corr']:.4f} (p={correlation['pearson_p']:.4f})\n"
-            f"Spearman Correlation: {correlation['spearman_corr']:.4f} (p={correlation['spearman_p']:.4f})")
-    fig.text(0.5, 0.01, text, ha='center', fontsize=12)
+    # Plot 4: Error Distribution
+    ax4 = axes[1, 1]
+    ax4.hist(comparison_df['call_error_pct'].dropna(), bins=50, alpha=0.5, label='Call Error %')
+    ax4.hist(comparison_df['put_error_pct'].dropna(), bins=50, alpha=0.5, label='Put Error %')
+    ax4.set_title('Pricing Error Distribution (% Difference)')
+    ax4.set_xlabel('Error Percentage')
+    ax4.set_ylabel('Count')
+    ax4.legend()
+    ax4.grid(True)
     
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.1)
+    plt.show()
+    
+    # Additional visualizations
+    # Pricing error by moneyness (Strike/Spot)
+    comparison_df['moneyness'] = comparison_df['strike'] / comparison_df['underlying']
+    
+    plt.figure(figsize=(12, 6))
+    plt.scatter(comparison_df['moneyness'], comparison_df['call_error_pct'], alpha=0.5, label='Call Error %')
+    plt.scatter(comparison_df['moneyness'], comparison_df['put_error_pct'], alpha=0.5, label='Put Error %')
+    plt.axhline(y=0, color='r', linestyle='--')
+    plt.title('Pricing Error by Moneyness')
+    plt.xlabel('Moneyness (Strike/Spot)')
+    plt.ylabel('Error Percentage')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    # Pricing error by DTE
+    plt.figure(figsize=(12, 6))
+    plt.scatter(comparison_df['dte'], comparison_df['call_error_pct'], alpha=0.5, label='Call Error %')
+    plt.scatter(comparison_df['dte'], comparison_df['put_error_pct'], alpha=0.5, label='Put Error %')
+    plt.axhline(y=0, color='r', linestyle='--')
+    plt.title('Pricing Error by Days to Expiration')
+    plt.xlabel('Days to Expiration')
+    plt.ylabel('Error Percentage')
+    plt.legend()
+    plt.grid(True)
     plt.show()
 
-# Execute the benchmark
+# Main function to run the entire analysis
+def main():
+    """Main function to run the entire analysis"""
+    try:
+        # Fetch market data
+        print("Fetching market data...")
+        sp500, vix, spy = fetch_data()
+        
+        # Calculate returns
+        sp500_returns = calculate_returns(sp500)
+        spy_returns = calculate_returns(spy)
+        
+        # Calculate entropy and volatility for S&P 500
+        print("Calculating entropy and volatility...")
+        window_size = DEFAULT_WINDOW_SIZE
+        sp500_entropy = calculate_rolling_entropy(sp500_returns, window_size=window_size)
+        sp500_hist_vol = realized_volatility(sp500_returns, window=window_size)
+        
+        # Calculate entropy and volatility for SPY
+        spy_entropy = calculate_rolling_entropy(spy_returns, window_size=window_size)
+        spy_hist_vol = realized_volatility(spy_returns, window=window_size)
+        
+        # Process VIX data (proxy for implied volatility)
+        vix_data = vix['Close']
+        
+        # Calibrate implied volatility model using S&P 500 data and VIX
+        print("Calibrating IV model using entropy, historical volatility, and VIX...")
+        iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
+        
+        # Print model calibration metrics
+        print("\nImplied Volatility Model Metrics:")
+        print(f"R-squared: {iv_metrics['r2']:.4f}")
+        print(f"RMSE: {iv_metrics['rmse']:.4f}")
+        print(f"MAE: {iv_metrics['mae']:.4f}")
+        print("\nModel Coefficients:")
+        print(f"Intercept: {iv_metrics['coefficients']['intercept']:.6f}")
+        print(f"Entropy coefficient: {iv_metrics['coefficients']['entropy']:.6f}")
+        print(f"Historical volatility coefficient: {iv_metrics['coefficients']['hist_vol']:.6f}")
+        
+        # Process SPY options data
+        print("\nProcessing SPY options data...")
+        options_file_path = "spy_2020_2022.csv"  # Update path if needed
+        try:
+            spy_options = process_options_data(options_file_path)
+            
+            if not spy_options.empty:
+                # Compare model prices with market prices
+                print("\nComparing entropy-based option prices with market prices...")
+                comparison_results = compare_option_prices(
+                    spy_options, iv_model, spy_entropy, spy_hist_vol
+                )
+                
+                if not comparison_results.empty:
+                    # Calculate overall pricing error metrics
+                    call_mae = np.abs(comparison_results['call_error_pct']).mean()
+                    put_mae = np.abs(comparison_results['put_error_pct']).mean()
+                    
+                    print(f"\nPricing Error Metrics:")
+                    print(f"Call option MAE: {call_mae:.2f}%")
+                    print(f"Put option MAE: {put_mae:.2f}%")
+                    
+                    # Visualize comparison results
+                    visualize_comparison(comparison_results)
+                else:
+                    print("No valid comparison results generated.")
+            else:
+                print("No valid options data loaded.")
+                
+        except FileNotFoundError:
+            print(f"Options data file not found: {options_file_path}")
+            print("Skipping options pricing comparison")
+        
+        # Example: Price a new option using the entropy-derived volatility
+        try:
+            last_date = spy_entropy.index[-1]
+            entropy_value = spy_entropy.iloc[-1]
+            hist_vol_value = spy_hist_vol.loc[last_date]
+            implied_vol = predict_implied_volatility(iv_model, entropy_value, hist_vol_value)
+            
+            current_price = spy['Close'].iloc[-1]
+            strike_price = round(current_price * 1.05, 2)  # 5% OTM
+            days_to_expiry = 30
+            
+            call_price = black_scholes_call(
+                current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
+            )
+            put_price = black_scholes_put(
+                current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
+            )
+            
+            print(f"\nExample Option Pricing using Entropy-Derived Volatility:")
+            print(f"Date: {last_date}")
+            print(f"SPY Price: ${current_price:.2f}")
+            print(f"Strike Price: ${strike_price:.2f}")
+            print(f"Days to Expiry: {days_to_expiry}")
+            print(f"Entropy: {entropy_value:.4f}")
+            print(f"Historical Volatility: {hist_vol_value:.4f}")
+            print(f"Entropy-Derived Implied Volatility: {implied_vol:.4f}")
+            print(f"Call Option Price: ${call_price:.2f}")
+            print(f"Put Option Price: ${put_price:.2f}")
+        except Exception as e:
+            print(f"Error pricing example option: {str(e)}")
+        
+        print("\nAnalysis complete!")
+        
+    except Exception as e:
+        print(f"Error during analysis: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
 if __name__ == "__main__":
-    # Calculate returns for S&P 500
-    returns = calculate_returns(sp500)
-    
-    # Run the benchmark
-    print("Running benchmark...")
-    results = benchmark_entropy_vs_vix(sp500, vix)
-    
-    # Find the window size with highest average correlation
-    best_avg_corr = -float('inf')
-    best_window = None
-    window_correlations = {}
-    
-    # Print key findings and find best window
-    for window, data in results.items():
-        corr = data['correlation']
-        print(f"\nWindow size {window} results:")
-        print(f"Pearson correlation: {corr['pearson_corr']:.4f} (p-value: {corr['pearson_p']:.4f})")
-        print(f"Spearman correlation: {corr['spearman_corr']:.4f} (p-value: {corr['spearman_p']:.4f})")
-        
-        # Calculate average of absolute correlation values
-        # We use absolute values because negative correlation is still informative
-        # TODO: maybe dont do this ?
-        avg_corr = (abs(corr['pearson_corr']) + abs(corr['spearman_corr'])) / 2
-        window_correlations[window] = avg_corr
-        
-        if avg_corr > best_avg_corr:
-            best_avg_corr = avg_corr
-            best_window = window
-        
-        # Find optimal lag
-        lead_lag = data['lead_lag']
-        optimal_lag = lead_lag.idxmax()
-        print(f"Optimal lag: {optimal_lag} days (correlation: {lead_lag.max():.4f})")
-        
-        if optimal_lag < 0:
-            print(f"VIX leads entropy by {abs(optimal_lag)} days")
-        elif optimal_lag > 0:
-            print(f"Entropy leads VIX by {optimal_lag} days")
-        else:
-            print("No lead-lag relationship detected")
-    
-    # Print best window size based on average correlation
-    print(f"\nBest window size based on average correlation: {best_window} (avg correlation: {best_avg_corr:.4f})")
-    print(f"Window correlations: {window_correlations}")
-    
-    entropy_for_vol = results[best_window]['entropy']
-    realized_vol = realized_volatility(returns, window=best_window).dropna()
-    vol_model = calibrate_entropy_to_volatility(entropy_for_vol, realized_vol)
-    predicted_vol_series = pd.Series(vol_model.predict(entropy_for_vol.values.reshape(-1, 1)), index=entropy_for_vol.index)
-
-    latest_entropy_date = predicted_vol_series.dropna().index[-1]
-    latest_vol = predicted_vol_series.loc[latest_entropy_date]
-    latest_price = sp500['Close'].loc[latest_entropy_date]
-
-    option_price = black_scholes_price(
-        spot=latest_price,
-        strike=latest_price * 1.05,
-        time_to_expiry=30/365,
-        rate=0.05,
-        volatility=latest_vol
-    )
-
-    print(f"Option price (based on entropy-implied volatility): {option_price:.2f}")
-
-    # Visualize results with the best window size
-    visualize_results(sp500, vix, results, window_size=best_window)
-    
-    print("\nBenchmark complete!")
+    main()
