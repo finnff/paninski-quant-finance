@@ -172,7 +172,11 @@ def calibrate_implied_volatility(entropy_series, hist_vol_series, vix_series):
     # Make sure everything is 1D by forcing to numpy arrays and flattening
     entropy_values = np.array(entropy_series.loc[common_idx]).flatten()
     hist_vol_values = np.array(hist_vol_series.loc[common_idx]).flatten()
-    vix_values = np.array(vix_series.loc[common_idx]).flatten()
+  # Scale VIX by dividing by 100 to convert from percentage to decimal
+    vix_values = np.array(vix_series.loc[common_idx]).flatten() / 100.0
+    
+    print(f"Original VIX range: {float(vix_series.loc[common_idx].min()):.2f} to {float(vix_series.loc[common_idx].max()):.2f}")
+    print(f"Scaled VIX range: {float(vix_values.min()):.4f} to {float(vix_values.max()):.4f}")
     
     # Prepare features (X) and target (y) with these flattened arrays
     X = pd.DataFrame({
@@ -868,6 +872,13 @@ def example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model):
         strike_price = round(current_price * 1.05, 2)  # 5% OTM
         days_to_expiry = 30
         
+        # Ensure implied volatility is reasonable
+        if implied_vol > 1.0:  # Cap at 100%
+            print(f"Warning: Capping implied volatility from {implied_vol:.4f} to 1.0")
+            implied_vol = 1.0
+        
+        # Display volatility in both decimal and percentage format
+        print(f"Entropy-Derived Implied Volatility: {implied_vol:.4f} ({implied_vol*100:.2f}%)")
         # Calculate option prices
         call_price = black_scholes_call(
             current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
@@ -891,8 +902,12 @@ def example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model):
         print(f"Error pricing example option: {str(e)}")
         import traceback
         traceback.print_exc()
-# Modified main function with maximum error percentage parameter
-def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=500):
+
+
+
+
+
+def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=500, force_recalibrate=True):
     """
     Main function to run the entire analysis
     
@@ -901,14 +916,63 @@ def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=
     - save_results: Whether to save results to disk
     - min_option_price: Minimum option price to consider (filters out cheap options)
     - max_error_pct: Maximum allowed percentage error (to filter outliers)
+    - force_recalibrate: Whether to force recalibration of the IV model
     """
     try:
-        # If using cache, try to load comparison results first
-        if use_cache:
+        # Fetch market data (always needed)
+        print("Fetching market data...")
+        sp500, vix, spy = fetch_data()
+        
+        # Calculate returns
+        sp500_returns = calculate_returns(sp500)
+        spy_returns = calculate_returns(spy)
+        
+        # Calculate entropy and volatility
+        print("Calculating entropy and volatility...")
+        window_size = DEFAULT_WINDOW_SIZE
+        sp500_entropy = calculate_rolling_entropy(sp500_returns, window_size=window_size)
+        sp500_hist_vol = realized_volatility(sp500_returns, window=window_size)
+        spy_entropy = calculate_rolling_entropy(spy_returns, window_size=window_size)
+        spy_hist_vol = realized_volatility(spy_returns, window=window_size)
+        
+        # Process VIX data (proxy for implied volatility)
+        vix_data = vix['Close']
+        
+        # Always recalibrate the model with scaled VIX values
+        if force_recalibrate:
+            print("Calibrating IV model using entropy, historical volatility, and scaled VIX (VIX/100)...")
+            iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
+            
+            # Save model if requested
+            if save_results:
+                save_iv_model(iv_model, iv_metrics)
+        else:
+            # Try to load IV model from cache
+            iv_model, iv_metrics = load_iv_model() if use_cache else (None, None)
+            
+            if iv_model is None:
+                print("Calibrating IV model using entropy, historical volatility, and scaled VIX (VIX/100)...")
+                iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
+                
+                # Save model if requested
+                if save_results:
+                    save_iv_model(iv_model, iv_metrics)
+        
+        # Print model calibration metrics
+        print("\nImplied Volatility Model Metrics:")
+        print(f"R-squared: {iv_metrics['r2']:.4f}")
+        print(f"RMSE: {iv_metrics['rmse']:.4f}")
+        print(f"MAE: {iv_metrics['mae']:.4f}")
+        print("\nModel Coefficients:")
+        print(f"Intercept: {iv_metrics['coefficients']['intercept']:.6f}")
+        print(f"Entropy coefficient: {iv_metrics['coefficients']['entropy']:.6f}")
+        print(f"Historical volatility coefficient: {iv_metrics['coefficients']['hist_vol']:.6f}")
+        
+        # Check if we're using cached results for the comparison
+        if use_cache and not force_recalibrate:
             cache_data = load_comparison_results()
             if cache_data is not None:
                 comparison_results = cache_data['comparison_results']
-                iv_metrics = cache_data['iv_metrics']
                 
                 # Calculate pricing error metrics using finite values only
                 call_errors = comparison_results['call_error_pct'].dropna()
@@ -924,76 +988,13 @@ def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=
                 # Visualize comparison results
                 visualize_comparison(comparison_results)
                 
-                # Example option pricing - we still need market data for this
-                print("Fetching market data for example option pricing...")
-                sp500, vix, spy = fetch_data()
-                spy_returns = calculate_returns(spy)
-                window_size = DEFAULT_WINDOW_SIZE
-                spy_entropy = calculate_rolling_entropy(spy_returns, window_size=window_size)
-                spy_hist_vol = realized_volatility(spy_returns, window=window_size)
-                
-                # Load IV model from cache or recalibrate
-                iv_model, _ = load_iv_model()
-                if iv_model is None:
-                    print("Recalibrating IV model...")
-                    sp500_returns = calculate_returns(sp500)
-                    sp500_entropy = calculate_rolling_entropy(sp500_returns, window_size=window_size)
-                    sp500_hist_vol = realized_volatility(sp500_returns, window=window_size)
-                    vix_data = vix['Close']
-                    iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
-                    if save_results:
-                        save_iv_model(iv_model, iv_metrics)
-                
                 # Price an example option
                 example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model)
                 
-                print("\nAnalysis complete using cached results!")
+                print("\nAnalysis complete using cached comparison results!")
                 return
         
-        # If not using cache or no cache found, proceed with full calculation
-        print("Fetching market data...")
-        sp500, vix, spy = fetch_data()
-        
-        # Calculate returns
-        sp500_returns = calculate_returns(sp500)
-        spy_returns = calculate_returns(spy)
-        
-        # Calculate entropy and volatility for S&P 500
-        print("Calculating entropy and volatility...")
-        window_size = DEFAULT_WINDOW_SIZE
-        sp500_entropy = calculate_rolling_entropy(sp500_returns, window_size=window_size)
-        sp500_hist_vol = realized_volatility(sp500_returns, window=window_size)
-        
-        # Calculate entropy and volatility for SPY
-        spy_entropy = calculate_rolling_entropy(spy_returns, window_size=window_size)
-        spy_hist_vol = realized_volatility(spy_returns, window=window_size)
-        
-        # Process VIX data (proxy for implied volatility)
-        vix_data = vix['Close']
-        
-        # Try to load IV model from cache
-        iv_model, iv_metrics = load_iv_model() if use_cache else (None, None)
-        
-        if iv_model is None:
-            # Calibrate implied volatility model using S&P 500 data and VIX
-            print("Calibrating IV model using entropy, historical volatility, and VIX...")
-            iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
-            
-            # Save model if requested
-            if save_results:
-                save_iv_model(iv_model, iv_metrics)
-        
-        # Print model calibration metrics
-        print("\nImplied Volatility Model Metrics:")
-        print(f"R-squared: {iv_metrics['r2']:.4f}")
-        print(f"RMSE: {iv_metrics['rmse']:.4f}")
-        print(f"MAE: {iv_metrics['mae']:.4f}")
-        print("\nModel Coefficients:")
-        print(f"Intercept: {iv_metrics['coefficients']['intercept']:.6f}")
-        print(f"Entropy coefficient: {iv_metrics['coefficients']['entropy']:.6f}")
-        print(f"Historical volatility coefficient: {iv_metrics['coefficients']['hist_vol']:.6f}")
-        
-        # Process SPY options data
+        # Process SPY options data for fresh comparison
         print("\nProcessing SPY options data...")
         options_file_path = "spy_2020_2022.csv"  # Update path if needed
         try:
@@ -1045,10 +1046,10 @@ def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=
         print(f"Error during analysis: {str(e)}")
         import traceback
         traceback.print_exc()
+
 if __name__ == "__main__":
-    # You can control caching behavior here:
-    # - use_cache=False will force recalculation
-    # - save_results=True will save new results to disk
-    # - min_option_price=1.0 will filter out options cheaper than $1.00
-    # - max_error_pct=500 will filter out options with errors greater than 500%
-    main(use_cache=False, save_results=True, min_option_price=1.0, max_error_pct=500)
+    # Configuration:
+    # - force_recalibrate=True to ensure the model is recalibrated with scaled VIX
+    # - use_cache=False to force recalculation of results
+    # - save_results=True to save the new results to disk
+    main(use_cache=False, save_results=True, min_option_price=1.0, max_error_pct=500, force_recalibrate=True)
