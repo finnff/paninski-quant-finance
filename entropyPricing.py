@@ -29,7 +29,7 @@ MIN_SAMPLES_FOR_CORRELATION = 3 # Minimum samples required for correlation calcu
 
 # rolling window parameters
 ROLLING_WINDOW_SIZES = [5, 10, 20, 30, 60]  # Window sizes for rolling entropy calculation
-DEFAULT_WINDOW_SIZE = 20         # Default window size for visualization
+DEFAULT_WINDOW_SIZE = 10         # Default window size for visualization
 
 # Lead-lag analysis parameters
 MAX_LAG_DAYS = 10               # Maximum days to test for lead-lag relationships
@@ -906,7 +906,8 @@ def example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model):
 
 
 
-def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=500, force_recalibrate=True):
+def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=500, 
+         force_recalibrate=True, optimize_window=False):
     """
     Main function to run the entire analysis
     
@@ -916,6 +917,7 @@ def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=
     - min_option_price: Minimum option price to consider (filters out cheap options)
     - max_error_pct: Maximum allowed percentage error (to filter outliers)
     - force_recalibrate: Whether to force recalibration of the IV model
+    - optimize_window: Whether to optimize the rolling window size (True) or use the default (False)
     """
     try:
         # Fetch market data (always needed)
@@ -926,9 +928,6 @@ def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=
         sp500_returns = calculate_returns(sp500)
         spy_returns = calculate_returns(spy)
         
-        # Store results for all window sizes
-        window_results = []
-        
         # Process SPY options data for comparison
         print("\nProcessing SPY options data...")
         options_file_path = SPY_OPTIONS_FILE
@@ -938,9 +937,13 @@ def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=
             print("No valid options data loaded.")
             return
         
-        # Loop through all window sizes
-        print("\nTesting different rolling window sizes...")
-        for window_size in ROLLING_WINDOW_SIZES:
+        if optimize_window:
+            # Store results for all window sizes
+            window_results = []
+            
+            # Loop through all window sizes
+            print("\nTesting different rolling window sizes...")
+            for window_size in ROLLING_WINDOW_SIZES:
             print(f"\n==== Testing Window Size: {window_size} ====")
             
             # Calculate entropy and volatility for this window size
@@ -1007,42 +1010,112 @@ def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=
                     save_iv_model(iv_model, iv_metrics)
             else:
                 print(f"No valid comparison results generated for window size {window_size}.")
-        
-        # Find the best window size based on combined MAE
-        if window_results:
-            print("\n==== Summary of Results for Different Window Sizes ====")
-            print("\nWindow Size | Call MAE | Put MAE | Combined MAE | R-squared")
-            print("------------|----------|---------|--------------|----------")
             
-            for result in window_results:
-                print(f"{result['window_size']:11} | {result['call_mae']:7.2f}% | {result['put_mae']:6.2f}% | {result['combined_mae']:11.2f}% | {result['r2']:9.4f}")
-            
-            # Find the window size with the lowest combined MAE
-            valid_results = [r for r in window_results if not np.isnan(r['combined_mae'])]
-            
-            if valid_results:
-                best_result = min(valid_results, key=lambda x: x['combined_mae'])
-                best_window_size = best_result['window_size']
+            # Find the best window size based on combined MAE
+            if window_results:
+                print("\n==== Summary of Results for Different Window Sizes ====")
+                print("\nWindow Size | Call MAE | Put MAE | Combined MAE | R-squared")
+                print("------------|----------|---------|--------------|----------")
                 
-                print(f"\n==== Best Window Size: {best_window_size} ====")
-                print(f"Call option MAE: {best_result['call_mae']:.2f}%")
-                print(f"Put option MAE: {best_result['put_mae']:.2f}%")
-                print(f"Combined MAE: {best_result['combined_mae']:.2f}%")
-                print(f"R-squared: {best_result['r2']:.4f}")
+                for result in window_results:
+                    print(f"{result['window_size']:11} | {result['call_mae']:7.2f}% | {result['put_mae']:6.2f}% | {result['combined_mae']:11.2f}% | {result['r2']:9.4f}")
                 
-                # Visualize the best results
-                print("\nVisualizing results for the best window size...")
-                visualize_comparison(best_result['comparison_results'])
+                # Find the window size with the lowest combined MAE
+                valid_results = [r for r in window_results if not np.isnan(r['combined_mae'])]
                 
-                # Example: Price a new option using the entropy-derived volatility with the best window size
-                print("\nPricing example option with the best window size...")
-                spy_entropy_best = calculate_rolling_entropy(spy_returns, window_size=best_window_size)
-                spy_hist_vol_best = realized_volatility(spy_returns, window=best_window_size)
-                example_option_pricing(spy, spy_entropy_best, spy_hist_vol_best, best_result['iv_model'])
+                if valid_results:
+                    best_result = min(valid_results, key=lambda x: x['combined_mae'])
+                    best_window_size = best_result['window_size']
+                    
+                    print(f"\n==== Best Window Size: {best_window_size} ====")
+                    print(f"Call option MAE: {best_result['call_mae']:.2f}%")
+                    print(f"Put option MAE: {best_result['put_mae']:.2f}%")
+                    print(f"Combined MAE: {best_result['combined_mae']:.2f}%")
+                    print(f"R-squared: {best_result['r2']:.4f}")
+                    
+                    # Use the best window size for subsequent analysis
+                    window_size = best_window_size
+                    iv_model = best_result['iv_model']
+                    iv_metrics = best_result['iv_metrics']
+                    comparison_results = best_result['comparison_results']
+                else:
+                    print("\nNo valid results available to determine the best window size.")
+                    # Fallback to default window size
+                    window_size = DEFAULT_WINDOW_SIZE
             else:
-                print("\nNo valid results available to determine the best window size.")
+                print("\nNo results available for any window size.")
+                # Fallback to default window size
+                window_size = DEFAULT_WINDOW_SIZE
         else:
-            print("\nNo results available for any window size.")
+            # If not optimizing, use the default window size
+            window_size = DEFAULT_WINDOW_SIZE
+            
+            # Calculate entropy and volatility with the default window size
+            print(f"Calculating entropy and volatility with default window size {window_size}...")
+            sp500_entropy = calculate_rolling_entropy(sp500_returns, window_size=window_size)
+            sp500_hist_vol = realized_volatility(sp500_returns, window=window_size)
+            spy_entropy = calculate_rolling_entropy(spy_returns, window_size=window_size)
+            spy_hist_vol = realized_volatility(spy_returns, window=window_size)
+            
+            # Process VIX data (proxy for implied volatility)
+            vix_data = vix['Close']
+            
+            # Try to load IV model from cache if not optimizing
+            if not force_recalibrate and use_cache:
+                iv_model, iv_metrics = load_iv_model()
+            else:
+                iv_model = None
+                
+            # Calibrate model if necessary
+            if iv_model is None:
+                print(f"Calibrating IV model with default window size {window_size}...")
+                iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
+                
+                # Save model if requested
+                if save_results:
+                    save_iv_model(iv_model, iv_metrics)
+            
+            # Print model calibration metrics
+            print("\nImplied Volatility Model Metrics:")
+            print(f"R-squared: {iv_metrics['r2']:.4f}")
+            print(f"RMSE: {iv_metrics['rmse']:.4f}")
+            print(f"MAE: {iv_metrics['mae']:.4f}")
+            
+            # Compare model prices with market prices
+            print("\nComparing entropy-based option prices with market prices...")
+            comparison_results = compare_option_prices(
+                spy_options, iv_model, spy_entropy, spy_hist_vol,
+                min_option_price=min_option_price,
+                max_error_pct=max_error_pct
+            )
+            
+            # Save results if requested
+            if save_results:
+                save_comparison_results(comparison_results, iv_metrics, window_size)
+        
+        # Visualize the results
+        if not comparison_results.empty:
+            print("\nVisualizing results...")
+            visualize_comparison(comparison_results)
+            
+            # Calculate pricing error metrics using finite values only
+            call_errors = comparison_results['call_error_pct'].dropna()
+            put_errors = comparison_results['put_error_pct'].dropna()
+            
+            call_mae = call_errors.abs().mean() if not call_errors.empty else np.nan
+            put_mae = put_errors.abs().mean() if not put_errors.empty else np.nan
+            
+            print(f"\nFinal Pricing Error Metrics (Window Size {window_size}, In-the-Money Options):")
+            print(f"Call option MAE: {call_mae:.2f}%")
+            print(f"Put option MAE: {put_mae:.2f}%")
+            
+            # Example: Price a new option using the entropy-derived volatility
+            print("\nPricing example option...")
+            spy_entropy_final = calculate_rolling_entropy(spy_returns, window_size=window_size)
+            spy_hist_vol_final = realized_volatility(spy_returns, window=window_size)
+            example_option_pricing(spy, spy_entropy_final, spy_hist_vol_final, iv_model)
+        else:
+            print("\nNo valid comparison results generated for final analysis.")
         
         print("\nAnalysis complete!")
         
@@ -1056,4 +1129,6 @@ if __name__ == "__main__":
     # - force_recalibrate=True to ensure models are calibrated for each window size
     # - use_cache=False to force recalculation of results
     # - save_results=True to save the results to disk
-    main(use_cache=False, save_results=True, min_option_price=1.0, max_error_pct=500, force_recalibrate=True)
+    # - optimize_window=True to find the best window size
+    main(use_cache=False, save_results=True, min_option_price=1.0, max_error_pct=500, 
+         force_recalibrate=True, optimize_window=False)
