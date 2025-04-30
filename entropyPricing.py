@@ -944,36 +944,36 @@ def main(use_cache=True, save_results=True, min_option_price=1.0, max_error_pct=
             # Loop through all window sizes
             print("\nTesting different rolling window sizes...")
             for window_size in ROLLING_WINDOW_SIZES:
-            print(f"\n==== Testing Window Size: {window_size} ====")
-            
-            # Calculate entropy and volatility for this window size
-            print(f"Calculating entropy and volatility with window size {window_size}...")
-            sp500_entropy = calculate_rolling_entropy(sp500_returns, window_size=window_size)
-            sp500_hist_vol = realized_volatility(sp500_returns, window=window_size)
-            spy_entropy = calculate_rolling_entropy(spy_returns, window_size=window_size)
-            spy_hist_vol = realized_volatility(spy_returns, window=window_size)
-            
-            # Process VIX data (proxy for implied volatility)
-            vix_data = vix['Close']
-            
-            # Calibrate model for this window size
-            print(f"Calibrating IV model with window size {window_size}...")
-            iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
-            
-            # Print model calibration metrics
-            print(f"\nImplied Volatility Model Metrics (Window Size {window_size}):")
-            print(f"R-squared: {iv_metrics['r2']:.4f}")
-            print(f"RMSE: {iv_metrics['rmse']:.4f}")
-            print(f"MAE: {iv_metrics['mae']:.4f}")
-            
-            # Compare model prices with market prices
-            print(f"Comparing entropy-based option prices with market prices (Window Size {window_size})...")
-            comparison_results = compare_option_prices(
-                spy_options, iv_model, spy_entropy, spy_hist_vol,
-                min_option_price=min_option_price,
-                max_error_pct=max_error_pct
-            )
-            
+                print(f"\n==== Testing Window Size: {window_size} ====")
+                
+                # Calculate entropy and volatility for this window size
+                print(f"Calculating entropy and volatility with window size {window_size}...")
+                sp500_entropy = calculate_rolling_entropy(sp500_returns, window_size=window_size)
+                sp500_hist_vol = realized_volatility(sp500_returns, window=window_size)
+                spy_entropy = calculate_rolling_entropy(spy_returns, window_size=window_size)
+                spy_hist_vol = realized_volatility(spy_returns, window=window_size)
+                
+                # Process VIX data (proxy for implied volatility)
+                vix_data = vix['Close']
+                
+                # Calibrate model for this window size
+                print(f"Calibrating IV model with window size {window_size}...")
+                iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
+                
+                # Print model calibration metrics
+                print(f"\nImplied Volatility Model Metrics (Window Size {window_size}):")
+                print(f"R-squared: {iv_metrics['r2']:.4f}")
+                print(f"RMSE: {iv_metrics['rmse']:.4f}")
+                print(f"MAE: {iv_metrics['mae']:.4f}")
+                
+                # Compare model prices with market prices
+                print(f"Comparing entropy-based option prices with market prices (Window Size {window_size})...")
+                comparison_results = compare_option_prices(
+                    spy_options, iv_model, spy_entropy, spy_hist_vol,
+                    min_option_price=min_option_price,
+                    max_error_pct=max_error_pct
+                )
+                
             if not comparison_results.empty:
                 # Calculate pricing error metrics using finite values only
                 call_errors = comparison_results['call_error_pct'].dropna()
