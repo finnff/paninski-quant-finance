@@ -134,6 +134,19 @@ def normalize_series(series):
     normalized = (series - series.min()) / (series.max() - series.min())
     return normalized
 
+# Calculate realized volatility
+def realized_volatility(returns, window=20):
+    return returns.rolling(window).std() * np.sqrt(252)
+
+from sklearn.linear_model import LinearRegression
+
+def calibrate_entropy_to_volatility(entropy_series, vol_series):
+    common_idx = entropy_series.index.intersection(vol_series.index)
+    x = entropy_series.loc[common_idx].values.reshape(-1, 1)
+    y = vol_series.loc[common_idx].values
+    model = LinearRegression().fit(x, y)
+    return model
+
 # Calculate correlation between entropy and VIX
 def calculate_correlation(entropy_series, vix_series):
     """Calculate correlation metrics between entropy and VIX"""
@@ -242,6 +255,12 @@ def backtest_strategy(sp500, entropy_series, threshold=ENTROPY_THRESHOLD):
         'sharpe_strategy': sharpe_strategy
     }
 
+# Calculate the Black-Scholes price of a call option
+def black_scholes_price(spot, strike, time_to_expiry, rate, volatility):
+    d1 = (np.log(spot / strike) + (rate + 0.5 * volatility ** 2) * time_to_expiry) / (volatility * np.sqrt(time_to_expiry))
+    d2 = d1 - volatility * np.sqrt(time_to_expiry)
+    call_price = spot * stats.norm.cdf(d1) - strike * np.exp(-rate * time_to_expiry) * stats.norm.cdf(d2)
+    return call_price
 
 # Main benchmark function
 def benchmark_entropy_vs_vix(sp500, vix, window_sizes=[20, 40, 60]):
@@ -391,6 +410,25 @@ if __name__ == "__main__":
     print(f"\nBest window size based on average correlation: {best_window} (avg correlation: {best_avg_corr:.4f})")
     print(f"Window correlations: {window_correlations}")
     
+    entropy_for_vol = results[best_window]['entropy']
+    realized_vol = realized_volatility(returns, window=best_window).dropna()
+    vol_model = calibrate_entropy_to_volatility(entropy_for_vol, realized_vol)
+    predicted_vol_series = pd.Series(vol_model.predict(entropy_for_vol.values.reshape(-1, 1)), index=entropy_for_vol.index)
+
+    latest_entropy_date = predicted_vol_series.dropna().index[-1]
+    latest_vol = predicted_vol_series.loc[latest_entropy_date]
+    latest_price = sp500['Close'].loc[latest_entropy_date]
+
+    option_price = black_scholes_price(
+        spot=latest_price,
+        strike=latest_price * 1.05,
+        time_to_expiry=30/365,
+        rate=0.05,
+        volatility=latest_vol
+    )
+
+    print(f"Option price (based on entropy-implied volatility): {option_price:.2f}")
+
     # Visualize results with the best window size
     visualize_results(sp500, vix, results, window_size=best_window)
     
