@@ -6,6 +6,14 @@ import yfinance as yf
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import datetime
+import os
+import pickle
+import datetime
+
+# File path constants for caching
+CACHE_DIR = "cache"
+COMPARISON_RESULTS_FILE = os.path.join(CACHE_DIR, "option_comparison_results.pkl")
+MODEL_CACHE_FILE = os.path.join(CACHE_DIR, "iv_model.pkl")
 
 # Data parameters
 DATA_START_DATE = '2020-01-01'  # Start date for data fetching
@@ -558,11 +566,169 @@ def visualize_comparison(comparison_df):
     plt.grid(True)
     plt.show()
 
-# Main function to run the entire analysis
-def main():
-    """Main function to run the entire analysis"""
+
+
+
+# Function to save comparison results to disk
+def save_comparison_results(comparison_df, iv_metrics, window_size):
+    """
+    Save comparison results to disk
+    
+    Parameters:
+    - comparison_df: DataFrame with comparison results
+    - iv_metrics: Metrics from IV model calibration
+    - window_size: Window size used for entropy calculation
+    """
+    # Create cache directory if it doesn't exist
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+    
+    # Create a cache object with results and metadata
+    cache_data = {
+        'comparison_results': comparison_df,
+        'iv_metrics': iv_metrics,
+        'window_size': window_size,
+        'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'data_range': f"{DATA_START_DATE} to {DATA_END_DATE}"
+    }
+    
+    # Save to disk
+    with open(COMPARISON_RESULTS_FILE, 'wb') as f:
+        pickle.dump(cache_data, f)
+    
+    print(f"Comparison results saved to {COMPARISON_RESULTS_FILE}")
+
+# Function to load comparison results from disk
+def load_comparison_results():
+    """
+    Load comparison results from disk
+    
+    Returns:
+    - Dictionary with comparison results and metadata, or None if file not found
+    """
+    if not os.path.exists(COMPARISON_RESULTS_FILE):
+        print(f"No cached results found at {COMPARISON_RESULTS_FILE}")
+        return None
+    
     try:
-        # Fetch market data
+        with open(COMPARISON_RESULTS_FILE, 'rb') as f:
+            cache_data = pickle.load(f)
+        
+        print(f"Loaded cached results from {COMPARISON_RESULTS_FILE}")
+        print(f"Generated on: {cache_data['timestamp']}")
+        print(f"Data range: {cache_data['data_range']}")
+        print(f"Window size: {cache_data['window_size']}")
+        return cache_data
+    except Exception as e:
+        print(f"Error loading cached results: {str(e)}")
+        return None
+
+# Function to save calibrated IV model to disk
+def save_iv_model(model, metrics):
+    """
+    Save calibrated IV model to disk
+    
+    Parameters:
+    - model: Calibrated LinearRegression model
+    - metrics: Model evaluation metrics
+    """
+    # Create cache directory if it doesn't exist
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+    
+    # Create a cache object with model and metadata
+    cache_data = {
+        'model': model,
+        'metrics': metrics,
+        'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'data_range': f"{DATA_START_DATE} to {DATA_END_DATE}"
+    }
+    
+    # Save to disk
+    with open(MODEL_CACHE_FILE, 'wb') as f:
+        pickle.dump(cache_data, f)
+    
+    print(f"IV model saved to {MODEL_CACHE_FILE}")
+
+# Function to load calibrated IV model from disk
+def load_iv_model():
+    """
+    Load calibrated IV model from disk
+    
+    Returns:
+    - Tuple of (model, metrics) or (None, None) if file not found
+    """
+    if not os.path.exists(MODEL_CACHE_FILE):
+        print(f"No cached IV model found at {MODEL_CACHE_FILE}")
+        return None, None
+    
+    try:
+        with open(MODEL_CACHE_FILE, 'rb') as f:
+            cache_data = pickle.load(f)
+        
+        print(f"Loaded cached IV model from {MODEL_CACHE_FILE}")
+        print(f"Generated on: {cache_data['timestamp']}")
+        print(f"Data range: {cache_data['data_range']}")
+        return cache_data['model'], cache_data['metrics']
+    except Exception as e:
+        print(f"Error loading cached IV model: {str(e)}")
+        return None, None
+
+# Modified main function with caching
+def main(use_cache=True, save_results=True):
+    """
+    Main function to run the entire analysis
+    
+    Parameters:
+    - use_cache: Whether to use cached results if available
+    - save_results: Whether to save results to disk
+    """
+    try:
+        # If using cache, try to load comparison results first
+        if use_cache:
+            cache_data = load_comparison_results()
+            if cache_data is not None:
+                comparison_results = cache_data['comparison_results']
+                iv_metrics = cache_data['iv_metrics']
+                
+                # Calculate pricing error metrics
+                call_mae = np.abs(comparison_results['call_error_pct']).mean()
+                put_mae = np.abs(comparison_results['put_error_pct']).mean()
+                
+                print(f"\nPricing Error Metrics:")
+                print(f"Call option MAE: {call_mae:.2f}%")
+                print(f"Put option MAE: {put_mae:.2f}%")
+                
+                # Visualize comparison results
+                visualize_comparison(comparison_results)
+                
+                # Example option pricing - we still need market data for this
+                print("Fetching market data for example option pricing...")
+                sp500, vix, spy = fetch_data()
+                spy_returns = calculate_returns(spy)
+                window_size = DEFAULT_WINDOW_SIZE
+                spy_entropy = calculate_rolling_entropy(spy_returns, window_size=window_size)
+                spy_hist_vol = realized_volatility(spy_returns, window=window_size)
+                
+                # Load IV model from cache or recalibrate
+                iv_model, _ = load_iv_model()
+                if iv_model is None:
+                    print("Recalibrating IV model...")
+                    sp500_returns = calculate_returns(sp500)
+                    sp500_entropy = calculate_rolling_entropy(sp500_returns, window_size=window_size)
+                    sp500_hist_vol = realized_volatility(sp500_returns, window=window_size)
+                    vix_data = vix['Close']
+                    iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
+                    if save_results:
+                        save_iv_model(iv_model, iv_metrics)
+                
+                # Price an example option
+                example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model)
+                
+                print("\nAnalysis complete using cached results!")
+                return
+        
+        # If not using cache or no cache found, proceed with full calculation
         print("Fetching market data...")
         sp500, vix, spy = fetch_data()
         
@@ -583,9 +749,17 @@ def main():
         # Process VIX data (proxy for implied volatility)
         vix_data = vix['Close']
         
-        # Calibrate implied volatility model using S&P 500 data and VIX
-        print("Calibrating IV model using entropy, historical volatility, and VIX...")
-        iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
+        # Try to load IV model from cache
+        iv_model, iv_metrics = load_iv_model() if use_cache else (None, None)
+        
+        if iv_model is None:
+            # Calibrate implied volatility model using S&P 500 data and VIX
+            print("Calibrating IV model using entropy, historical volatility, and VIX...")
+            iv_model, iv_metrics = calibrate_implied_volatility(sp500_entropy, sp500_hist_vol, vix_data)
+            
+            # Save model if requested
+            if save_results:
+                save_iv_model(iv_model, iv_metrics)
         
         # Print model calibration metrics
         print("\nImplied Volatility Model Metrics:")
@@ -606,9 +780,14 @@ def main():
             if not spy_options.empty:
                 # Compare model prices with market prices
                 print("\nComparing entropy-based option prices with market prices...")
+                print("This may take a while for large datasets...")
                 comparison_results = compare_option_prices(
                     spy_options, iv_model, spy_entropy, spy_hist_vol
                 )
+                
+                # Save results if requested
+                if save_results:
+                    save_comparison_results(comparison_results, iv_metrics, window_size)
                 
                 if not comparison_results.empty:
                     # Calculate overall pricing error metrics
@@ -631,35 +810,7 @@ def main():
             print("Skipping options pricing comparison")
         
         # Example: Price a new option using the entropy-derived volatility
-        try:
-            last_date = spy_entropy.index[-1]
-            entropy_value = spy_entropy.iloc[-1]
-            hist_vol_value = spy_hist_vol.loc[last_date]
-            implied_vol = predict_implied_volatility(iv_model, entropy_value, hist_vol_value)
-            
-            current_price = spy['Close'].iloc[-1]
-            strike_price = round(current_price * 1.05, 2)  # 5% OTM
-            days_to_expiry = 30
-            
-            call_price = black_scholes_call(
-                current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
-            )
-            put_price = black_scholes_put(
-                current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
-            )
-            
-            print(f"\nExample Option Pricing using Entropy-Derived Volatility:")
-            print(f"Date: {last_date}")
-            print(f"SPY Price: ${current_price:.2f}")
-            print(f"Strike Price: ${strike_price:.2f}")
-            print(f"Days to Expiry: {days_to_expiry}")
-            print(f"Entropy: {entropy_value:.4f}")
-            print(f"Historical Volatility: {hist_vol_value:.4f}")
-            print(f"Entropy-Derived Implied Volatility: {implied_vol:.4f}")
-            print(f"Call Option Price: ${call_price:.2f}")
-            print(f"Put Option Price: ${put_price:.2f}")
-        except Exception as e:
-            print(f"Error pricing example option: {str(e)}")
+        example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model)
         
         print("\nAnalysis complete!")
         
@@ -668,5 +819,50 @@ def main():
         import traceback
         traceback.print_exc()
 
+# Helper function for example option pricing
+def example_option_pricing(spy, spy_entropy, spy_hist_vol, iv_model):
+    """
+    Price an example option using the entropy-derived volatility
+    
+    Parameters:
+    - spy: SPY price data
+    - spy_entropy: Entropy series for SPY
+    - spy_hist_vol: Historical volatility series for SPY
+    - iv_model: Calibrated IV model
+    """
+    try:
+        last_date = spy_entropy.index[-1]
+        entropy_value = spy_entropy.iloc[-1]
+        hist_vol_value = spy_hist_vol.loc[last_date]
+        implied_vol = predict_implied_volatility(iv_model, entropy_value, hist_vol_value)
+        
+        current_price = spy['Close'].iloc[-1]
+        strike_price = round(current_price * 1.05, 2)  # 5% OTM
+        days_to_expiry = 30
+        
+        call_price = black_scholes_call(
+            current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
+        )
+        put_price = black_scholes_put(
+            current_price, strike_price, days_to_expiry/365, RISK_FREE_RATE, implied_vol
+        )
+        
+        print(f"\nExample Option Pricing using Entropy-Derived Volatility:")
+        print(f"Date: {last_date}")
+        print(f"SPY Price: ${current_price:.2f}")
+        print(f"Strike Price: ${strike_price:.2f}")
+        print(f"Days to Expiry: {days_to_expiry}")
+        print(f"Entropy: {entropy_value:.4f}")
+        print(f"Historical Volatility: {hist_vol_value:.4f}")
+        print(f"Entropy-Derived Implied Volatility: {implied_vol:.4f}")
+        print(f"Call Option Price: ${call_price:.2f}")
+        print(f"Put Option Price: ${put_price:.2f}")
+    except Exception as e:
+        print(f"Error pricing example option: {str(e)}")
+
+# Usage example
 if __name__ == "__main__":
-    main()
+    # You can control caching behavior here:
+    # - use_cache=True will use cached results if available
+    # - save_results=True will save new results to disk
+    main(use_cache=True, save_results=True)
