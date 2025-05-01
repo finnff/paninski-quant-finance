@@ -29,7 +29,7 @@ MIN_SAMPLES_FOR_CORRELATION = 3 # Minimum samples required for correlation calcu
 
 # rolling window parameters
 ROLLING_WINDOW_SIZES = [5,6,7,8,9,10,11,12,13,14,15,20, 30, 60]  # Window sizes for rolling entropy calculation
-DEFAULT_WINDOW_SIZE = 10         # Default window size for visualization
+DEFAULT_WINDOW_SIZE = 11         # Default window size for visualization
 
 # Lead-lag analysis parameters
 MAX_LAG_DAYS = 10               # Maximum days to test for lead-lag relationships
