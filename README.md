@@ -2,6 +2,8 @@
 
 This project implements an end-to-end workflow that uses information-theoretic metrics (Shannon entropy) to predict implied volatility and price options using the Black-Scholes model. The approach leverages Paninski's entropy estimation method to extract market uncertainty information from price returns.
 
+The accompanying paper (*Entropy-Enhanced Option Pricing:Improving Black-Scholes with Information Theory*) can be found at [Entropy-Enhanced_Option_Pricing.pdf](./Entropy-Enhanced_Option_Pricing.pdf)
+
 ## Pre-requisites
 
 ### To download historical spy options data (`./spy_2020_2022.csv`) please run 
